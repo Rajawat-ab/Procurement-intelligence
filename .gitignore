@@ -2,3 +2,8 @@
 .Rhistory
 .RData
 .Ruserdata
+.Renviron
+
+reports/
+logs/
+rsconnect/

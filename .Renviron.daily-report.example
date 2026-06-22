@@ -1,0 +1,8 @@
+PROCUREGRAPH_MAPPING_FILE=C:/path/to/your/mapping.xlsx
+PROCUREGRAPH_REPORT_DIR=C:/ProcureGraphReports
+
+PROCUREGRAPH_EMAIL_FROM=your.email@moglix.com
+PROCUREGRAPH_EMAIL_TO=recipient1@moglix.com,recipient2@moglix.com
+PROCUREGRAPH_EMAIL_PASS=your_outlook_app_password
+PROCUREGRAPH_SMTP_HOST=smtp.office365.com
+PROCUREGRAPH_SMTP_PORT=587
