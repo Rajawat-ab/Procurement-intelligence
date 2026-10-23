@@ -9,6 +9,7 @@ suppressPackageStartupMessages({
   library(stringr)
   library(jsonlite)
   library(grid)
+  library(openxlsx)
 })
 
 `%||%` <- function(a, b) if (!is.null(a) && length(a) > 0 && !is.na(a) && nzchar(as.character(a))) a else b
@@ -151,6 +152,7 @@ process_items <- function(raw, mapping, start_date, end_date) {
       `Remove(Y/N)` = character(),
       `PID-CID` = character(),
       `Client Name` = character(),
+      GRN = character(),
       Month = character(),
       check.names = FALSE
     ))
@@ -481,7 +483,9 @@ make_report_pdf <- function(label, start_date, end_date, df, grn, mapping, out_f
 
 mime_type <- function(path) {
   ext <- tolower(tools::file_ext(path))
-  if (ext == "pdf") "application/pdf" else "application/octet-stream"
+  if (ext == "pdf") "application/pdf" else if (ext == "xlsx") {
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+  } else "application/octet-stream"
 }
 
 send_email_with_attachments <- function(files, subject, body, html = FALSE) {
@@ -512,7 +516,26 @@ send_email_with_attachments <- function(files, subject, body, html = FALSE) {
     body
   )
 
-  for (file in files) {
+  # OneDrive can briefly delay visibility of freshly generated files. Stage
+  # attachments locally before encoding so SMTP reads a stable, closed file.
+  attachment_dir <- tempfile("procuregraph-attachments-")
+  dir.create(attachment_dir)
+  on.exit(unlink(attachment_dir, recursive = TRUE), add = TRUE)
+  staged_files <- vapply(files, function(file) {
+    staged <- file.path(attachment_dir, basename(file))
+    for (attempt in seq_len(10L)) {
+      if (file.exists(file) && isTRUE(file.info(file)$size > 0) &&
+          isTRUE(file.copy(file, staged, overwrite = TRUE))) break
+      Sys.sleep(1)
+    }
+    if (!file.exists(staged) || is.na(file.info(staged)$size) || file.info(staged)$size <= 0) {
+      stop(sprintf("Report attachment is missing or empty after waiting: %s", file), call. = FALSE)
+    }
+    staged
+  }, character(1))
+
+  for (i in seq_along(staged_files)) {
+    file <- staged_files[[i]]
     encoded <- jsonlite::base64_enc(readBin(file, "raw", n = file.info(file)$size))
     encoded <- paste(strwrap(encoded, width = 76), collapse = "\r\n")
     lines <- c(
@@ -531,7 +554,7 @@ send_email_with_attachments <- function(files, subject, body, html = FALSE) {
   on.exit(unlink(eml), add = TRUE)
 
   args <- c(
-    "-sS", "--show-error",
+    "-sS", "--show-error", "--connect-timeout", "30", "--max-time", "300",
     "--url", sprintf("smtp://%s:%s", host, port),
     "--ssl-reqd",
     "--user", paste0(from, ":", password),
@@ -545,7 +568,7 @@ send_email_with_attachments <- function(files, subject, body, html = FALSE) {
   invisible(TRUE)
 }
 
-build_email_summary_html <- function(df, grn, mapping, report_files) {
+build_email_summary_html <- function(df, grn, mapping, report_files, workbook_link) {
   valid <- df %>% filter(`Remove(Y/N)` == "Consider", `PID-CID` != "9802")
   count_metrics <- calc_metrics(create_pivot(valid, value_mode = FALSE))
   value_metrics <- calc_metrics(create_pivot(valid, value_mode = TRUE))
@@ -562,6 +585,10 @@ build_email_summary_html <- function(df, grn, mapping, report_files) {
     escape_html(basename(report_files)),
     "</li>",
     collapse = ""
+  )
+  workbook_link_html <- paste0(
+    "<a href=\"", escape_html(workbook_link), "\" style='display:inline-block;padding:12px 18px;border-radius:9px;background:#da191e;color:#ffffff;text-decoration:none;font-weight:700;'>",
+    "Download the Excel management workbook</a>"
   )
 
   metric_row <- function(label, value, accent) {
@@ -593,7 +620,7 @@ build_email_summary_html <- function(df, grn, mapping, report_files) {
     "<div style='background:#0e1d28;border-radius:22px 22px 0 0;padding:24px 28px;border-bottom:4px solid #da191e;'>",
     "<div style='font-size:12px;color:#93c5fd;font-weight:700;text-transform:uppercase;letter-spacing:.12em;'>ProcureGraph Daily Intelligence</div>",
     "<div style='font-size:28px;line-height:1.2;color:#ffffff;font-weight:900;margin-top:6px;'>Automated Procurement Integration Summary</div>",
-    "<div style='font-size:13px;color:#cbd5e1;margin-top:8px;'>", format(Sys.Date(), "%d %b %Y"), " | PDFs attached for MTD, Last Month and Last 3 Months</div>",
+    "<div style='font-size:13px;color:#cbd5e1;margin-top:8px;'>", format(Sys.Date(), "%d %b %Y"), " | Three PDF reports are attached</div>",
     "</div>",
     "<div style='background:#f8fbff;border:1px solid #dbeafe;border-top:none;border-radius:0 0 22px 22px;padding:18px;'>",
     "<table role='presentation' style='width:100%;border-collapse:collapse;'><tr>",
@@ -629,7 +656,11 @@ build_email_summary_html <- function(df, grn, mapping, report_files) {
     ),
     "</tr></table>",
     "<div style='margin:18px 8px 4px;padding:14px 16px;border-radius:14px;background:#ffffff;border:1px solid #e2e8f0;'>",
-    "<div style='font-size:12px;font-weight:800;color:#0e1d28;text-transform:uppercase;letter-spacing:.08em;margin-bottom:6px;'>Attached PDFs</div>",
+    "<div style='font-size:12px;font-weight:800;color:#0e1d28;text-transform:uppercase;letter-spacing:.08em;margin-bottom:10px;'>Download the Excel management workbook</div>",
+    workbook_link_html,
+    "</div>",
+    "<div style='margin:12px 8px 4px;padding:14px 16px;border-radius:14px;background:#ffffff;border:1px solid #e2e8f0;'>",
+    "<div style='font-size:12px;font-weight:800;color:#0e1d28;text-transform:uppercase;letter-spacing:.08em;margin-bottom:6px;'>Attached PDF reports</div>",
     "<ul style='margin:0;padding-left:18px;'>", file_list, "</ul>",
     "</div>",
     "</div>",
@@ -649,25 +680,420 @@ date_ranges <- function(today = Sys.Date()) {
   )
 }
 
+management_date_ranges <- function(today = Sys.Date()) {
+  first_this_month <- as.Date(format(today, "%Y-%m-01"))
+  first_last_month <- first_this_month %m-% months(1)
+  last_last_month <- first_this_month - 1
+  first_prior_month <- first_last_month %m-% months(1)
+  list(
+    list(key = "MTD", label = "MTD", start = first_this_month, end = today),
+    list(key = "LAST_MONTH", label = "Last Month", start = first_last_month, end = last_last_month),
+    list(key = "PRIOR_MONTH", label = "Month Before Last", start = first_prior_month, end = first_last_month - 1)
+  )
+}
+
+management_pivot <- function(df, value_mode = FALSE) {
+  statuses <- c("Live", "Live - CBB", "No Integration", "PR Int. - Punchout")
+  metric <- if (value_mode) "Amount_Crore" else "Line_Items"
+  summary <- df %>%
+    filter(
+      `Remove(Y/N)` == "Consider",
+      `PID-CID` != "9802",
+      `Final Status` %in% statuses,
+      source %in% c("EOC", "Manual", "SAP")
+    ) %>%
+    group_by(`Final Status`, source) %>%
+    summarise(
+      Metric = if (value_mode) sum(Amount_Crore, na.rm = TRUE) else n(),
+      .groups = "drop"
+    ) %>%
+    pivot_wider(names_from = source, values_from = Metric, values_fill = 0)
+
+  for (source_name in c("EOC", "Manual", "SAP")) {
+    if (!source_name %in% names(summary)) summary[[source_name]] <- rep(0, nrow(summary))
+  }
+  out <- data.frame(`Final Status` = statuses, stringsAsFactors = FALSE, check.names = FALSE) %>%
+    left_join(summary, by = "Final Status") %>%
+    mutate(across(c(EOC, Manual, SAP), ~coalesce(.x, 0))) %>%
+    mutate(`Grand Total` = EOC + Manual + SAP)
+  total <- out %>% summarise(
+    `Final Status` = "Grand Total",
+    EOC = sum(EOC), Manual = sum(Manual), SAP = sum(SAP),
+    `Grand Total` = sum(`Grand Total`)
+  )
+  out <- bind_rows(out, total)
+  if (value_mode) out <- out %>% mutate(across(c(EOC, Manual, SAP, `Grand Total`), ~round(.x, 2)))
+  out
+}
+
+management_company_compare <- function(periods, period_data, value_mode = FALSE) {
+  parts <- lapply(periods, function(period) {
+    summary <- company_summary(period_data[[period$key]]$df)
+    out <- data.frame(`PID-CID` = summary$`PID-CID`, Company = summary$`Client Name`, check.names = FALSE)
+    if (value_mode) {
+      fields <- c(
+        "SAP_Value_Cr", "Manual_Value_Cr", "EOC_Value_Cr", "Total_Value_Cr",
+        "Integrated_Value_Cr", "Value_Integration_Pct"
+      )
+      labels <- c("SAP Cr", "Manual Cr", "EOC Cr", "Total Cr", "Integrated Cr", "Value Integration %")
+    } else {
+      fields <- c("SAP", "Manual", "EOC", "Grand_Total", "Integrated_Volume", "Integration_Pct")
+      labels <- c("SAP Items", "Manual Items", "EOC Items", "Total Items", "Integrated Items", "Integration %")
+    }
+    for (i in seq_along(fields)) out[[paste(period$label, labels[i])]] <- summary[[fields[i]]]
+    out
+  })
+  out <- Reduce(function(left, right) full_join(left, right, by = c("PID-CID", "Company")), parts)
+  if (!nrow(out)) return(out)
+  numeric_cols <- which(vapply(out, is.numeric, logical(1)))
+  for (col in numeric_cols) out[[col]][is.na(out[[col]])] <- 0
+  percent_cols <- grep("Integration %", names(out))
+  for (col in percent_cols) out[[col]] <- out[[col]] / 100
+  sort_col <- paste(periods[[1]]$label, if (value_mode) "Total Cr" else "Total Items")
+  if (sort_col %in% names(out)) out <- out[order(-out[[sort_col]], out$Company), , drop = FALSE]
+  out
+}
+
+prepare_management_grn_detail <- function(grn, df, mapping, period_label) {
+  columns <- c("Period", "PID-CID", "Client Name", "buyerId", "customerGrnNo", "poId", "itemId", "GrnDate", "Month")
+  if (is.null(grn) || !nrow(grn)) {
+    out <- as.data.frame(setNames(replicate(length(columns), logical(0), simplify = FALSE), columns), check.names = FALSE)
+    out$Period <- character(0)
+    out$`PID-CID` <- character(0)
+    out$`Client Name` <- character(0)
+    out$buyerId <- character(0)
+    out$customerGrnNo <- character(0)
+    out$poId <- character(0)
+    out$itemId <- character(0)
+    out$GrnDate <- as.Date(character(0))
+    out$Month <- character(0)
+    return(out[, columns, drop = FALSE])
+  }
+  grn %>%
+    mutate(
+      buyerId = trimws(as.character(buyerId)),
+      GrnDate = as.Date(as.POSIXct(creationDate / 1000, origin = "1970-01-01")),
+      Month = format(GrnDate, "%Y-%m")
+    ) %>%
+    left_join(mapping$plant, by = c("buyerId" = "plantId")) %>%
+    left_join(mapping$company, by = "companyId") %>%
+    mutate(
+      `PID-CID` = coalesce(companyId, "Unknown"),
+      `Client Name` = coalesce(companyName, "Unknown")
+    ) %>%
+    filter(
+      `PID-CID` %in% (df %>% filter(GRN == "Y") %>% distinct(`PID-CID`) %>% pull(`PID-CID`)),
+      `PID-CID` != "9802"
+    ) %>%
+    transmute(
+      Period = period_label, `PID-CID`, `Client Name`, buyerId,
+      customerGrnNo = as.character(customerGrnNo), poId = as.character(poId),
+      itemId = as.character(itemId), GrnDate, Month
+    )
+}
+
+management_grn_company <- function(period, period_data, mapping) {
+  df <- period_data[[period$key]]$df
+  grn <- prepare_management_grn_detail(period_data[[period$key]]$grn, df, mapping, period$label)
+  eligible <- mapping$company %>%
+    mutate(GRN = toupper(trimws(as.character(GRN)))) %>%
+    filter(
+      GRN == "Y", companyId != "9802",
+      `Final Status` %in% c("Live", "Live - CBB", "PR Int. - Punchout")
+    ) %>%
+    transmute(`PID-CID` = as.character(companyId), Company = coalesce(as.character(companyName), "Unknown")) %>%
+    distinct(`PID-CID`, .keep_all = TRUE)
+  po <- df %>%
+    filter(
+      `Remove(Y/N)` == "Consider", `PID-CID` != "9802",
+      `Final Status` %in% c("Live", "Live - CBB", "PR Int. - Punchout")
+    ) %>%
+    group_by(`PID-CID`, Company = `Client Name`) %>%
+    summarise(
+      `PO Line Items` = n(),
+      SAP = sum(source == "SAP", na.rm = TRUE),
+      Manual = sum(source == "Manual", na.rm = TRUE),
+      EOC = sum(source == "EOC", na.rm = TRUE),
+      .groups = "drop"
+    )
+  grn_counts <- grn %>%
+    group_by(`PID-CID`, Company = `Client Name`) %>%
+    summarise(`GRN Records` = n(), .groups = "drop")
+  eligible %>%
+    left_join(po, by = c("PID-CID", "Company")) %>%
+    left_join(grn_counts, by = c("PID-CID", "Company")) %>%
+    mutate(
+      across(c(`PO Line Items`, SAP, Manual, EOC, `GRN Records`), ~coalesce(.x, 0L)),
+      `GRN %` = ifelse(`PO Line Items` > 0, `GRN Records` / `PO Line Items`, NA_real_),
+      Period = period$label
+    ) %>%
+    select(Period, `PID-CID`, Company, `PO Line Items`, SAP, Manual, EOC, `GRN Records`, `GRN %`) %>%
+    arrange(desc(`GRN Records`), Company)
+}
+
+write_management_sheet <- function(wb, sheet_name, title, subtitle, data,
+                                   tab_colour = "#006495", value_mode = FALSE,
+                                   custom_widths = NULL) {
+  addWorksheet(wb, sheet_name, gridLines = FALSE, tabColour = tab_colour)
+  writeData(wb, sheet_name, title, startRow = 1, colNames = FALSE)
+  writeData(wb, sheet_name, subtitle, startRow = 2, colNames = FALSE)
+  if (!ncol(data)) data <- data.frame(Note = character(0))
+  title_style <- createStyle(fontName = "Arial", fontSize = 16, textDecoration = "bold", fontColour = "#0E1D28")
+  subtitle_style <- createStyle(fontName = "Arial", fontSize = 10, fontColour = "#64748B", textDecoration = "italic", wrapText = TRUE)
+  header_style <- createStyle(fontName = "Arial", fontSize = 10, textDecoration = "bold", fontColour = "#FFFFFF", fgFill = "#0E1D28", halign = "center", valign = "center", wrapText = TRUE, border = "Bottom", borderColour = "#DA191E", borderStyle = "medium")
+  body_style <- createStyle(fontName = "Arial", fontSize = 10, fontColour = "#1E293B", valign = "top")
+  addStyle(wb, sheet_name, title_style, rows = 1, cols = 1, gridExpand = TRUE)
+  addStyle(wb, sheet_name, subtitle_style, rows = 2, cols = 1, gridExpand = TRUE)
+  writeData(wb, sheet_name, data, startRow = 4, headerStyle = header_style, withFilter = FALSE)
+  setRowHeights(wb, sheet_name, rows = 4, heights = 30)
+  if (nrow(data) > 0) {
+    data_rows <- 5:(4 + nrow(data))
+    addStyle(wb, sheet_name, body_style, rows = data_rows, cols = seq_len(ncol(data)), gridExpand = TRUE, stack = TRUE)
+    date_cols <- which(vapply(data, inherits, logical(1), what = "Date"))
+    pct_cols <- grep("Integration %|GRN %", names(data))
+    numeric_cols <- which(vapply(data, is.numeric, logical(1)))
+    for (col in date_cols) addStyle(wb, sheet_name, createStyle(numFmt = "dd mmm yyyy"), rows = data_rows, cols = col, gridExpand = TRUE, stack = TRUE)
+    for (col in setdiff(numeric_cols, pct_cols)) {
+      fmt <- if (value_mode) "#,##0.00;[Red](#,##0.00);-" else "#,##0;[Red](#,##0);-"
+      addStyle(wb, sheet_name, createStyle(numFmt = fmt, halign = "right"), rows = data_rows, cols = col, gridExpand = TRUE, stack = TRUE)
+    }
+    for (col in pct_cols) addStyle(wb, sheet_name, createStyle(numFmt = "0.0%", halign = "right"), rows = data_rows, cols = col, gridExpand = TRUE, stack = TRUE)
+    if (length(pct_cols)) {
+      conditionalFormatting(wb, sheet_name, cols = pct_cols, rows = data_rows, type = "colourScale", style = c("#F8696B", "#FFEB84", "#63BE7B"))
+    }
+    addFilter(wb, sheet_name, rows = 4, cols = seq_len(ncol(data)))
+    first_col <- if (ncol(data) >= 3) 3 else 1
+    freezePane(wb, sheet_name, firstActiveRow = 5, firstActiveCol = first_col)
+  }
+  if (is.null(custom_widths)) {
+    widths <- vapply(seq_along(data), function(i) {
+      values <- as.character(data[[i]])
+      values <- values[!is.na(values)]
+      sample_values <- head(values, 500)
+      max(12, min(34, max(c(nchar(names(data)[i]), nchar(sample_values), 0), na.rm = TRUE) + 2))
+    }, numeric(1))
+  } else {
+    widths <- custom_widths
+  }
+  setColWidths(wb, sheet_name, cols = seq_len(ncol(data)), widths = widths)
+  invisible(sheet_name)
+}
+
+write_management_guide <- function(wb, periods) {
+  sheet <- "Rules & Guide"
+  addWorksheet(wb, sheet, gridLines = FALSE, tabColour = "#DA191E")
+  title_style <- createStyle(fontName = "Arial", fontSize = 16, textDecoration = "bold", fontColour = "#0E1D28")
+  subtitle_style <- createStyle(fontName = "Arial", fontSize = 10, fontColour = "#64748B", textDecoration = "italic")
+  header_style <- createStyle(fontName = "Arial", fontSize = 10, textDecoration = "bold", fontColour = "#FFFFFF", fgFill = "#0E1D28", wrapText = TRUE, valign = "center")
+  body_style <- createStyle(fontName = "Arial", fontSize = 10, fontColour = "#1E293B", wrapText = TRUE, valign = "top")
+  writeData(wb, sheet, "ProcureGraph Management Workbook", startRow = 1, colNames = FALSE)
+  writeData(wb, sheet, paste("Generated", format(Sys.time(), "%d %b %Y %H:%M"), "| Amounts are in INR crore"), startRow = 2, colNames = FALSE)
+  addStyle(wb, sheet, title_style, rows = 1, cols = 1)
+  addStyle(wb, sheet, subtitle_style, rows = 2, cols = 1)
+  writeData(wb, sheet, "Reporting periods", startRow = 4, colNames = FALSE)
+  addStyle(wb, sheet, createStyle(textDecoration = "bold", fontColour = "#006495"), rows = 4, cols = 1)
+  period_table <- data.frame(
+    Period = vapply(periods, `[[`, character(1), "label"),
+    `Start Date` = as.Date(vapply(periods, function(x) as.character(x$start), character(1))),
+    `End Date` = as.Date(vapply(periods, function(x) as.character(x$end), character(1))),
+    check.names = FALSE
+  )
+  writeData(wb, sheet, period_table, startRow = 5, headerStyle = header_style)
+  addStyle(wb, sheet, body_style, rows = 6:(5 + nrow(period_table)), cols = 1:3, gridExpand = TRUE, stack = TRUE)
+  addStyle(wb, sheet, createStyle(numFmt = "dd mmm yyyy"), rows = 6:(5 + nrow(period_table)), cols = 2:3, gridExpand = TRUE, stack = TRUE)
+
+  rules <- data.frame(
+    Topic = c(
+      "Included sources", "Integration", "Manual / CBB", "Item date window", "Stage rule",
+      "Company mapping", "Integration status", "Havells rule", "SC rule", "Remove flag",
+      "ABFRL", "Value conversion", "Value integration", "GRN eligibility", "GRN rate"
+    ),
+    Definition = c(
+      "Only SAP, Manual and EOC sources are included in the pivots and company comparisons.",
+      "Integrated items are SAP plus Manual. Company Integration % = (SAP items + Manual items) / total included items.",
+      "CBB % = Manual items / total included items. The pivots show EOC, Manual, SAP and Grand Total by mapped integration status.",
+      "MTD is from the first day of this month through the report date. Last Month and Month Before Last are complete calendar months.",
+      "Closed and Cancelled items are removed.",
+      "Buyer ID maps through PID-CID to company ID and then to company name. Unmapped companies remain visible in PO detail as Unknown.",
+      "The mapped Final Status must not be Ignore. The pivot tracks Live, Live - CBB, No Integration and PR Int. - Punchout.",
+      "For company 1211, only customer SA numbers beginning with 45 are considered.",
+      "For company 8853, only buyer IDs 9550, 9557, 25976, 26023, 26186 and 26187 with SA numbers not beginning with 71 are considered. Other buyers are removed.",
+      "A line is Consider only when source, stage, selected date range, mapped status, company-specific rule and GRN mapping all pass. Removed lines remain in PO detail with their rule columns.",
+      "Company 9802 is excluded from PO pivots and company comparisons, matching the existing report. It remains available in line detail.",
+      "Amount_Crore = source amount / 10,000,000. Value sheets report amounts in INR crore.",
+      "Value Integration % = (SAP value + Manual value) / total included value.",
+      "GRN accounts require mapped GRN = Y and a Final Status of Live, Live - CBB or PR Int. - Punchout. Company 9802 is excluded.",
+      "GRN % = eligible GRN records / eligible PO line items. This follows the existing report and can exceed 100% when multiple GRNs relate to a PO item."
+    ),
+    check.names = FALSE
+  )
+  writeData(wb, sheet, "Business rules and metric definitions", startRow = 10, colNames = FALSE)
+  addStyle(wb, sheet, createStyle(textDecoration = "bold", fontColour = "#006495"), rows = 10, cols = 1)
+  writeData(wb, sheet, rules, startRow = 11, headerStyle = header_style)
+  addStyle(wb, sheet, body_style, rows = 12:(11 + nrow(rules)), cols = 1:2, gridExpand = TRUE, stack = TRUE)
+  setRowHeights(wb, sheet, rows = 12:(11 + nrow(rules)), heights = "auto")
+  setColWidths(wb, sheet, cols = 1, widths = 25)
+  setColWidths(wb, sheet, cols = 2, widths = 105)
+  setColWidths(wb, sheet, cols = 3, widths = 18)
+  invisible(sheet)
+}
+
+write_period_pivot_sheet <- function(wb, sheet_name, title, subtitle, periods,
+                                     period_data, value_mode = FALSE,
+                                     tab_colour = "#006495") {
+  addWorksheet(wb, sheet_name, gridLines = FALSE, tabColour = tab_colour)
+
+  title_style <- createStyle(fontName = "Arial", fontSize = 16, textDecoration = "bold", fontColour = "#0E1D28")
+  subtitle_style <- createStyle(fontName = "Arial", fontSize = 10, fontColour = "#64748B", textDecoration = "italic", wrapText = TRUE)
+  period_style <- createStyle(fontName = "Arial", fontSize = 12, textDecoration = "bold", fontColour = "#FFFFFF", fgFill = tab_colour, valign = "center")
+  date_style <- createStyle(fontName = "Arial", fontSize = 10, fontColour = "#475569", textDecoration = "italic")
+  header_style <- createStyle(fontName = "Arial", fontSize = 10, textDecoration = "bold", fontColour = "#FFFFFF", fgFill = "#0E1D28", halign = "center", valign = "center", wrapText = TRUE, border = "Bottom", borderColour = "#DA191E", borderStyle = "medium")
+  body_style <- createStyle(fontName = "Arial", fontSize = 10, fontColour = "#1E293B", valign = "center")
+  number_style <- createStyle(numFmt = if (value_mode) "#,##0.00;[Red](#,##0.00);-" else "#,##0;[Red](#,##0);-", halign = "right")
+  total_style <- createStyle(textDecoration = "bold", fgFill = "#E8EFF5", border = "Top", borderColour = "#94A3B8", borderStyle = "thin")
+
+  writeData(wb, sheet_name, title, startRow = 1, colNames = FALSE)
+  writeData(wb, sheet_name, subtitle, startRow = 2, colNames = FALSE)
+  mergeCells(wb, sheet_name, cols = 1:5, rows = 1)
+  mergeCells(wb, sheet_name, cols = 1:5, rows = 2)
+  addStyle(wb, sheet_name, title_style, rows = 1, cols = 1)
+  addStyle(wb, sheet_name, subtitle_style, rows = 2, cols = 1)
+  setRowHeights(wb, sheet_name, rows = 1, heights = 28)
+  setRowHeights(wb, sheet_name, rows = 2, heights = 24)
+
+  section_row <- 4L
+  for (period in periods) {
+    month_name <- format(period$start, "%B")
+    section_title <- if (identical(period$key, "MTD")) paste(month_name, "MTD") else month_name
+    date_range <- paste(format(period$start, "%d %b %Y"), "–", format(period$end, "%d %b %Y"))
+    table_row <- section_row + 3L
+    pivot <- management_pivot(period_data[[period$key]]$df, value_mode = value_mode)
+
+    writeData(wb, sheet_name, section_title, startRow = section_row, colNames = FALSE)
+    mergeCells(wb, sheet_name, cols = 1:5, rows = section_row)
+    addStyle(wb, sheet_name, period_style, rows = section_row, cols = 1)
+    setRowHeights(wb, sheet_name, rows = section_row, heights = 25)
+
+    writeData(wb, sheet_name, date_range, startRow = section_row + 1L, colNames = FALSE)
+    mergeCells(wb, sheet_name, cols = 1:5, rows = section_row + 1L)
+    addStyle(wb, sheet_name, date_style, rows = section_row + 1L, cols = 1)
+
+    writeData(wb, sheet_name, pivot, startRow = table_row, headerStyle = header_style, withFilter = FALSE)
+    setRowHeights(wb, sheet_name, rows = table_row, heights = 30)
+    data_rows <- seq.int(table_row + 1L, length.out = nrow(pivot))
+    addStyle(wb, sheet_name, body_style, rows = data_rows, cols = 1:5, gridExpand = TRUE, stack = TRUE)
+    addStyle(wb, sheet_name, number_style, rows = data_rows, cols = 2:5, gridExpand = TRUE, stack = TRUE)
+    addStyle(wb, sheet_name, total_style, rows = tail(data_rows, 1), cols = 1:5, gridExpand = TRUE, stack = TRUE)
+
+    section_row <- table_row + nrow(pivot) + 3L
+  }
+
+  setColWidths(wb, sheet_name, cols = 1, widths = 31)
+  setColWidths(wb, sheet_name, cols = 2:4, widths = 15)
+  setColWidths(wb, sheet_name, cols = 5, widths = 17)
+  freezePane(wb, sheet_name, firstActiveRow = 7)
+  invisible(sheet_name)
+}
+
+write_po_item_details <- function(wb, periods, period_data) {
+  detail <- bind_rows(lapply(periods, function(period) {
+    df <- period_data[[period$key]]$df
+    data.frame(Period = rep(period$label, nrow(df)), df, check.names = FALSE)
+  }))
+
+  max_data_rows <- 1048572L
+  if (nrow(detail) > max_data_rows) {
+    stop(
+      sprintf("Combined PO Item Details has %s rows, exceeding Excel's sheet limit of %s data rows.", nrow(detail), max_data_rows),
+      call. = FALSE
+    )
+  }
+
+  write_management_sheet(
+    wb, "PO Item Details", "PO Item Details",
+    "Processed PO lines across MTD, Last Month, and Month Before Last. Use the Period filter to show one reporting month. Remove and mapping columns explain each row's inclusion status.",
+    detail, tab_colour = "#64748B"
+  )
+}
+
+make_management_workbook <- function(periods, period_data, mapping, out_file) {
+  wb <- createWorkbook(creator = "ProcureGraph")
+  write_management_guide(wb, periods)
+
+  write_period_pivot_sheet(
+    wb, "Item Count Pivots", "PO Integration by Item Count",
+    "Included PO line counts by final status and source. Company 9802 is excluded.",
+    periods, period_data, value_mode = FALSE, tab_colour = "#006495"
+  )
+
+  write_period_pivot_sheet(
+    wb, "Value Pivots Cr", "PO Integration by Value",
+    "Included PO amount by final status and source, in INR crore. Company 9802 is excluded.",
+    periods, period_data, value_mode = TRUE, tab_colour = "#10A37F"
+  )
+
+  count_compare <- management_company_compare(periods, period_data, value_mode = FALSE)
+  write_management_sheet(wb, "Company Count Compare", "Company Item Count Comparison", "Each company is compared across MTD, Last Month and Month Before Last. Integrated items are SAP plus Manual.", count_compare, tab_colour = "#006495")
+  value_compare <- management_company_compare(periods, period_data, value_mode = TRUE)
+  write_management_sheet(wb, "Company Value Compare", "Company Value Comparison", "Each company is compared across MTD, Last Month and Month Before Last. Values are in INR crore.", value_compare, tab_colour = "#10A37F", value_mode = TRUE)
+
+  grn_summary <- bind_rows(lapply(periods, function(period) {
+    df <- period_data[[period$key]]$df
+    grn <- period_data[[period$key]]$grn
+    metrics <- grn_summary_metrics(df, grn, mapping)
+    data.frame(
+      Period = period$label, `Start Date` = period$start, `End Date` = period$end,
+      `Eligible Accounts` = metrics$eligible_accounts,
+      `PO Volume Accounts` = metrics$po_accounts,
+      `Eligible PO Line Items` = metrics$po_line_items,
+      `GRN Volume Accounts` = metrics$grn_accounts,
+      `GRN Records` = metrics$grn_records,
+      `GRN %` = if (metrics$po_line_items > 0) metrics$grn_pct / 100 else NA_real_,
+      check.names = FALSE
+    )
+  }))
+  write_management_sheet(wb, "GRN Summary", "GRN Integration Comparison", "Account and record counts for the same three workbook periods. GRN % is GRN records divided by eligible PO line items.", grn_summary, tab_colour = "#F59E0B")
+
+  grn_company <- bind_rows(lapply(periods, function(period) management_grn_company(period, period_data, mapping)))
+  write_management_sheet(wb, "GRN by Company", "GRN by Eligible Company", "Eligible GRN accounts with PO line counts, source mix and GRN record counts by period.", grn_company, tab_colour = "#F59E0B")
+
+  grn_detail <- bind_rows(lapply(periods, function(period) {
+    prepare_management_grn_detail(period_data[[period$key]]$grn, period_data[[period$key]]$df, mapping, period$label)
+  }))
+  write_management_sheet(wb, "GRN Detail", "GRN Record Detail", "Mapped GRN records for GRN-enabled companies in the reporting periods. Company 9802 is excluded.", grn_detail, tab_colour = "#F59E0B")
+  write_po_item_details(wb, periods, period_data)
+
+  saveWorkbook(wb, out_file, overwrite = TRUE)
+  invisible(out_file)
+}
+
 main <- function() {
   load_project_env()
+  workbook_link <- env_value("PROCUREGRAPH_WORKBOOK_LINK", required = FALSE)
+  if (!nzchar(workbook_link)) {
+    stop("Set PROCUREGRAPH_WORKBOOK_LINK in .Renviron before sending the report email.", call. = FALSE)
+  }
   mongo_conn <- env_value("PROCUREGRAPH_MONGO_CONN")
   mapping_file <- env_value("PROCUREGRAPH_MAPPING_FILE")
   output_root <- env_value("PROCUREGRAPH_REPORT_DIR", required = FALSE, default = file.path(getwd(), "reports", "daily"))
 
   mapping <- load_mapping(mapping_file)
-  ranges <- date_ranges(Sys.Date())
-  run_dir <- file.path(output_root, format(Sys.Date(), "%Y-%m-%d"))
+  report_day <- Sys.Date()
+  ranges <- date_ranges(report_day)
+  workbook_ranges <- management_date_ranges(report_day)
+  run_dir <- file.path(output_root, format(report_day, "%Y-%m-%d"))
   dir.create(run_dir, recursive = TRUE, showWarnings = FALSE)
 
   pdfs <- character()
   mtd_df <- NULL
   mtd_grn <- NULL
+  period_data <- list()
   for (rng in ranges) {
     message("Generating ", rng$label, " report: ", rng$start, " to ", rng$end)
     raw <- get_mongo_items(rng$start, rng$end, mongo_conn)
     grn <- get_mongo_grn(rng$start, rng$end, mongo_conn)
     df <- process_items(raw, mapping, rng$start, rng$end)
+    period_data[[rng$key]] <- list(df = df, grn = grn)
     out_file <- file.path(run_dir, paste0("ProcureGraph_", rng$key, "_", format(Sys.Date(), "%Y%m%d"), ".pdf"))
     make_report_pdf(rng$label, rng$start, rng$end, df, grn, mapping, out_file)
     pdfs <- c(pdfs, out_file)
@@ -677,10 +1103,32 @@ main <- function() {
     }
   }
 
-  email_body <- build_email_summary_html(mtd_df, mtd_grn, mapping, pdfs)
-  message("Sending email with ", length(pdfs), " PDF attachment(s).")
+  prior_month <- workbook_ranges[[3]]
+  message("Loading ", prior_month$label, " data for the comparison workbook: ", prior_month$start, " to ", prior_month$end)
+  prior_raw <- get_mongo_items(prior_month$start, prior_month$end, mongo_conn)
+  prior_grn <- get_mongo_grn(prior_month$start, prior_month$end, mongo_conn)
+  period_data[[prior_month$key]] <- list(
+    df = process_items(prior_raw, mapping, prior_month$start, prior_month$end),
+    grn = prior_grn
+  )
+
+  workbook_file <- file.path(run_dir, paste0("ProcureGraph_Management_Comparison_", format(report_day, "%Y%m%d"), ".xlsx"))
+  latest_dir <- file.path(output_root, "Management Workbook Latest")
+  dir.create(latest_dir, recursive = TRUE, showWarnings = FALSE)
+  latest_workbook_file <- file.path(latest_dir, "ProcureGraph_Management_Comparison_Latest.xlsx")
+  make_management_workbook(workbook_ranges, period_data, mapping, latest_workbook_file)
+  if (!file.copy(latest_workbook_file, workbook_file, overwrite = TRUE)) {
+    stop("Could not save the dated copy of the management workbook.", call. = FALSE)
+  }
+  attachments <- pdfs
+
+
+  message("Management workbook saved: ", normalizePath(workbook_file, winslash = "\\", mustWork = FALSE))
+
+  email_body <- build_email_summary_html(mtd_df, mtd_grn, mapping, attachments, workbook_link)
+  message("Sending email with ", length(attachments), " attachment(s).")
   email_sent <- send_email_with_attachments(
-    pdfs,
+    attachments,
     sprintf("ProcureGraph Daily Reports - %s", format(Sys.Date(), "%d %b %Y")),
     email_body,
     html = TRUE
@@ -688,7 +1136,7 @@ main <- function() {
   if (isTRUE(email_sent)) {
     message("Email sent successfully.")
   }
-  message("Done. Reports saved to: ", normalizePath(run_dir, winslash = "\\", mustWork = FALSE))
+  message("Done. PDFs and workbook saved to: ", normalizePath(run_dir, winslash = "\\", mustWork = FALSE))
 }
 
 tryCatch(main(), error = function(e) {

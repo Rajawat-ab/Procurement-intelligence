@@ -382,6 +382,32 @@ CARD   <- "bg-white rounded-2xl shadow-sm"
 BORDER <- "border:1px solid #f1f5f9;"
 `%||%` <- function(a, b) if (!is.null(a) && length(a) > 0 && nchar(trimws(as.character(a[1]))) > 0) a else b
 
+# ── Single sign-on with the "BuyerOS" launcher ──────────────────────
+# Only when started from the laptop (Launch ProcureGraph.cmd sets PROCUREGRAPH_LOCAL_SSO=1):
+# the launcher's login replaces this app's own. On shinyapps.io the variable is unset, so the
+# normal login screen stays. Token check matches Shared/sso.py in BuyerOS.
+LOCAL_SSO    <- identical(Sys.getenv("PROCUREGRAPH_LOCAL_SSO"), "1")
+LAUNCHER_URL <- "http://127.0.0.1:5050"
+
+sso_token_valid <- function(token) {
+  if (is.null(token) || !nzchar(token)) return(FALSE)
+  parts <- strsplit(token, ".", fixed = TRUE)[[1]]
+  if (length(parts) != 4 || parts[1] != "v1" || !grepl("^[0-9]+$", parts[3])) return(FALSE)
+  if (as.numeric(parts[3]) < as.numeric(Sys.time())) return(FALSE)
+  auth_dir  <- Sys.getenv("AT_AUTH_DIR", file.path(Sys.getenv("LOCALAPPDATA"), "BuyerOS"))
+  auth_file <- file.path(auth_dir, "auth.json")
+  secret <- tryCatch(jsonlite::fromJSON(auth_file)$secret, error = function(e) NULL)
+  if (is.null(secret) || !nzchar(secret)) return(FALSE)
+  want <- as.character(openssl::sha256(paste(parts[1:3], collapse = "."), key = secret))
+  identical(want, parts[4])
+}
+
+sso_cookie <- function(session) {
+  cookies <- strsplit(session$request$HTTP_COOKIE %||% "", ";\\s*")[[1]]
+  hit <- cookies[startsWith(cookies, "at_session=")]
+  if (length(hit)) sub("^at_session=", "", hit[1]) else ""
+}
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # 6. UI
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -389,6 +415,7 @@ ui <- fluidPage(
   useShinyjs(),
   tags$head(
     tags$meta(name = "viewport", content = "width=device-width, initial-scale=1, viewport-fit=cover"),
+    tags$link(rel = "icon", type = "image/png", href = "favicon.png"),
     tags$link(href = "https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&family=Manrope:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;600&display=swap", rel = "stylesheet"),
     tags$link(href = "https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:wght,FILL@100..700,0..1&display=swap", rel = "stylesheet"),
     tags$script(src = "https://cdn.tailwindcss.com?plugins=forms,container-queries"),
@@ -690,9 +717,32 @@ server <- function(input, output, session) {
     authenticated(FALSE)
     cached_data(NULL)
     cache_ts(NULL)
+    # Local: one login for all tools lives in the launcher, so go back there
+    if (LOCAL_SSO) shinyjs::runjs(sprintf("window.location.href = '%s/';", LAUNCHER_URL))
   })
-  
+
+  if (LOCAL_SSO) {
+    sso_checked <- FALSE
+    observe({
+      if (sso_checked) return()
+      query <- parseQueryString(session$clientData$url_search %||% "")
+      sso_checked <<- TRUE
+      if (sso_token_valid(query$sso %||% "") || sso_token_valid(sso_cookie(session))) {
+        authenticated(TRUE)
+      } else {
+        shinyjs::runjs(sprintf(
+          "window.location.replace('%s/login?next=' + encodeURIComponent(location.origin + location.pathname));",
+          LAUNCHER_URL))
+      }
+    })
+  }
+
   output$main_ui <- renderUI({
+    if (!authenticated() && LOCAL_SSO) {
+      return(tags$div(class = "login-page",
+                      tags$p(style = "color:#cbd5e1;font-family:'Manrope',sans-serif;",
+                             "Signing in with BuyerOS…")))
+    }
     if (!authenticated()) {
       # ── LOGIN PAGE ──────────────────────────────────────────────────────────
       tags$div(class = "login-page",

@@ -3,6 +3,8 @@
 .RData
 .Ruserdata
 .Renviron
+.Renviron.*
+!.Renviron.daily-report.example
 
 reports/
 logs/

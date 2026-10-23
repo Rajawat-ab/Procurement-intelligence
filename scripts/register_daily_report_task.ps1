@@ -1,6 +1,6 @@
 param(
   [string]$TaskName = "ProcureGraph Daily PDF Reports",
-  [string]$RunAt = "10:00",
+  [string]$RunAt = "11:00",
   [string]$RscriptPath = "Rscript.exe"
 )
 

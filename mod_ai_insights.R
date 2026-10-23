@@ -65,6 +65,23 @@ setup_ai_insights <- function(input, output, session,
     integrated <- sum(df$source %in% c("SAP","Manual"), na.rm = TRUE)
     int_pct    <- round(integrated/total*100, 1)
     
+    # 1. Semantic Definitions for AI
+    definitions <- paste0(
+      "DEFINITIONS:\n",
+      "- 'Integrated' source: 'SAP' or 'Manual'\n",
+      "- Integration Rate: (Integrated / Total) * 100\n",
+      "- Success Threshold: >= 85%\n",
+      "- Risk Threshold: < 50%\n\n"
+    )
+    
+    # 2. Core Metrics & Source Mix
+    src_dist <- tryCatch({
+      df %>% dplyr::count(source) %>% dplyr::arrange(dplyr::desc(n)) %>%
+        dplyr::mutate(txt=paste0(source,": ",n," (",round(n/sum(n)*100,1),"%)")) %>%
+        dplyr::pull(txt) %>% paste(collapse=" | ")
+    }, error=function(e) "")
+
+    # 3. Temporal Trends
     monthly <- tryCatch({
       df %>%
         dplyr::group_by(Month) %>%
@@ -75,32 +92,36 @@ setup_ai_insights <- function(input, output, session,
     }, error=function(e) NULL)
     
     mom_txt <- if (!is.null(monthly) && nrow(monthly)>=2) {
-      paste0(monthly$Month[1],": ",monthly$pct[1],"% | ",monthly$Month[2],": ",monthly$pct[2],"%")
+      paste0(monthly$Month[1], ": ",monthly$pct[1],"% | ",monthly$Month[2],": ",monthly$pct[2],"%")
     } else "Insufficient monthly data"
     
+    # 4. Client Segmentation
     comp_txt <- if (!is.null(comp_perf) && nrow(comp_perf)>0) {
       top3 <- comp_perf %>% dplyr::arrange(dplyr::desc(Integration_Pct)) %>% head(3)
       bot3 <- comp_perf %>% dplyr::arrange(Integration_Pct) %>% head(3)
       exc  <- sum(comp_perf$Integration_Pct>=85, na.rm=TRUE)
       und  <- sum(comp_perf$Integration_Pct<50, na.rm=TRUE)
-      paste0("COMPANY PERFORMANCE (", nrow(comp_perf), " active):\n",
-             "  Excellent (>=85%): ", exc, " | Under-performing (<50%): ", und, "\n",
-             "  Top: ", paste(paste0(top3$`Client Name`," (",top3$Integration_Pct,"%)"), collapse=", "), "\n",
-             "  Needs help: ", paste(paste0(bot3$`Client Name`," (",bot3$Integration_Pct,"%)"), collapse=", "))
-    } else ""
+      paste0("CLIENT PERFORMANCE:\n",
+             "  - High Performers (>=85%): ", exc, " | Top: ", paste(top3$`Client Name`, collapse=", "), "\n",
+             "  - At-Risk (<50%): ", und, " | Bottom: ", paste(bot3$`Client Name`, collapse=", "))
+    } else "No client performance data available"
     
-    src_dist <- tryCatch({
-      df %>% dplyr::count(source) %>% dplyr::arrange(dplyr::desc(n)) %>%
-        dplyr::mutate(txt=paste0(source,": ",n," (",round(n/sum(n)*100,1),"%)")) %>%
-        dplyr::pull(txt) %>% paste(collapse=" | ")
-    }, error=function(e) "")
-    
-    paste0("PROCUREGRAPH — ", format(Sys.Date(),"%B %Y"), "\n",
-           "Total Valid Line Items: ", format(total,big.mark=","), "\n",
-           "Integrated (SAP+Manual): ", format(integrated,big.mark=","), " (", int_pct, "%)\n\n",
-           "MoM TREND: ", mom_txt, "\n\n",
-           comp_txt, "\n\nSOURCE MIX: ", src_dist)
+    # Construct final structured context string
+    paste0(
+      "PROCUREGRAPH ANALYTICS CONTEXT\n",
+      "==============================\n",
+      definitions,
+      "CORE METRICS:\n",
+      "- Total Line Items: ", format(total, big.mark=","), "\n",
+      "- Integrated Items: ", format(integrated, big.mark=","), " (", int_pct, "%)\n",
+      "- Source Mix: ", src_dist, "\n\n",
+      "TEMPORAL TRENDS (Integration %):\n",
+      "- MoM: ", mom_txt, "\n\n",
+      comp_txt, "\n\n",
+      "INSTRUCTION: Use this context to provide actionable procurement insights."
+    )
   }
+
   
   # ─── Ollama call ──────────────────────────────────────────────────────────
   call_ollama <- function(history, summary) {

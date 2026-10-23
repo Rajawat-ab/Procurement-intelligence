@@ -151,7 +151,7 @@ setup_data_source <- function(input, output, session,
       rename_if("buyerId",         c("buyerId","buyer_id","BuyerID","buyer.id","buyerid","PlantId","plantId")) %>%
       rename_if("status",          c("status","Status","ORDER_STATUS")) %>%
       rename_if("creationDate",    c("creationDate","creation_date","CreationDate",
-                                     "creationdate","creationDate_epoch","date")) %>%
+                                     "creationdate","creationDate_epoch","creationDate_epoch_ms","date")) %>%
       rename_if("source",          c("source","Source","SOURCE")) %>%
       rename_if("stage",           c("stage","Stage","STAGE")) %>%
       rename_if("amount",          c("amount","Amount","AMOUNT","itemAmount","ItemAmount",
@@ -196,7 +196,7 @@ setup_data_source <- function(input, output, session,
       rename_if("_id",           c("_id","id","ID","document_id")) %>%
       rename_if("buyerId",       c("buyerId","buyer_id","BuyerID","buyer.id","plantId","PlantId")) %>%
       rename_if("creationDate",  c("creationDate","creation_date","CreationDate",
-                                   "creationdate","creationDate_epoch","date")) %>%
+                                   "creationdate","creationDate_epoch","creationDate_epoch_ms","date")) %>%
       rename_if("customerGrnNo", c("customerGrnNo","customer_grn_no","CustomerGrnNo","GRN_Number","grnNo")) %>%
       rename_if("poId",          c("poId","po_id","PoId","PO_ID","po_number")) %>%
       rename_if("itemId",        c("itemId","item_id","ItemId","ITEM_ID"))
@@ -268,6 +268,7 @@ setup_data_source <- function(input, output, session,
   # ── Template download handlers ─────────────────────────────────────────────
   output$ds_item_template <- downloadHandler(
     filename = function() "procuregraph_item_template.xlsx",
+    contentType = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     content  = function(file) {
       # Generate sample rows — one for each common source type
       template <- data.frame(
@@ -336,6 +337,7 @@ setup_data_source <- function(input, output, session,
 
   output$ds_grn_template <- downloadHandler(
     filename = function() "procuregraph_grn_template.xlsx",
+    contentType = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     content  = function(file) {
       template <- data.frame(
         `_id`                   = c("grn001","grn002","grn003"),

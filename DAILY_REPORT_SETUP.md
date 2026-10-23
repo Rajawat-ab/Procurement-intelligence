@@ -44,7 +44,7 @@ The report folder will be:
 PROCUREGRAPH_REPORT_DIR/YYYY-MM-DD/
 ```
 
-## 3. Register Daily 10 AM Task
+## 3. Register Daily 11 AM Task
 
 From PowerShell:
 
