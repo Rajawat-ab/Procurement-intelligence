@@ -263,6 +263,78 @@ is_integrated_line_item <- function(source_value) {
   source_value %in% c("SAP", "Manual")
 }
 
+# ── Time saved by integration (CS team's PO punching times) ──────────────────
+# Punching a PO by hand takes 4.5 min for its first line item and 1 min for each
+# extra line item in the same PO. Integration (SAP / Manual-CBB) removes that work.
+# A PO is unique per plant (buyer.id) + customer PO number: the same number can
+# exist at two plants. Integrated lines with no PO number can't be grouped into a
+# PO, so they are left out and reported separately.
+PUNCH_FIRST_LINE_MIN <- 4.5
+PUNCH_EXTRA_LINE_MIN <- 1
+
+po_time_saved_table <- function(df) {
+  empty <- tibble(`PID-CID` = character(), `Client Name` = character(), `buyer.id` = character(),
+                  PO = character(), Month = character(), Lines = integer(), Minutes = numeric())
+  if (is.null(df) || !nrow(df)) return(empty)
+  po <- trimws(as.character(df$`history.po.customerPoNo`))
+  keep <- is_integrated_line_item(df$source) & !is.na(po) & nzchar(po) & po != "NA"
+  if (!any(keep)) return(empty)
+  df[keep, , drop = FALSE] %>%
+    mutate(PO = po[keep]) %>%
+    group_by(`PID-CID`, `Client Name`, `buyer.id`, PO) %>%
+    summarise(Month = min(Month), Lines = n(), .groups = "drop") %>%  # a PO counts in its first month
+    mutate(Minutes = PUNCH_FIRST_LINE_MIN + (Lines - 1) * PUNCH_EXTRA_LINE_MIN)
+}
+
+po_time_saved_summary <- function(df) {
+  per_po <- po_time_saved_table(df)
+  integrated <- if (is.null(df) || !nrow(df)) 0L else sum(is_integrated_line_item(df$source))
+  minutes <- sum(per_po$Minutes)
+  list(pos = nrow(per_po), lines = sum(per_po$Lines), minutes = minutes, hours = minutes / 60,
+       days = minutes / 60 / 8, no_po_lines = integrated - sum(per_po$Lines))
+}
+
+po_time_saved_by <- function(df, ...) {
+  po_time_saved_table(df) %>%
+    group_by(...) %>%
+    summarise(`Unique POs` = n(), `Integrated line items` = sum(Lines),
+              `Minutes saved` = sum(Minutes), .groups = "drop") %>%
+    mutate(`Hours saved` = round(`Minutes saved` / 60, 1),
+           `Working days (8 h)` = round(`Minutes saved` / 480, 1)) %>%
+    arrange(desc(`Minutes saved`))
+}
+
+fmt_hours <- function(minutes) {
+  h <- minutes / 60
+  if (h >= 100) format(round(h), big.mark = ",") else format(round(h, 1), nsmall = 1)
+}
+
+# Card shown on Dashboard, PO Integration and Analytics; `scope` says which rows it covers
+time_saved_strip <- function(s, scope) {
+  stat <- function(label, value) {
+    tags$div(tags$p(class = "text-[10px] font-bold uppercase tracking-widest mb-1", style = "color:#94a3b8;", label),
+             tags$p(class = "text-xl font-extrabold", style = "color:#0e1d28;", value))
+  }
+  tags$div(class = "bg-white rounded-2xl shadow-sm p-6 anim-in", style = "border:1px solid #bbf7d0;",
+           tags$div(class = "flex flex-wrap items-center gap-8",
+                    tags$div(class = "flex items-center gap-4",
+                             tags$div(class = "w-14 h-14 rounded-2xl flex items-center justify-center", style = "background:#dcfce7;",
+                                      tags$span(class = "material-symbols-outlined text-3xl", style = "color:#15803d;", "timer")),
+                             tags$div(tags$p(class = "text-[10px] font-bold uppercase tracking-widest mb-1", style = "color:#15803d;", "Time saved by integration"),
+                                      tags$h3(class = "text-4xl font-extrabold", style = "font-family:'Plus Jakarta Sans',sans-serif;color:#15803d;",
+                                              paste(fmt_hours(s$minutes), "hours")))),
+                    stat("Minutes", format(round(s$minutes), big.mark = ",")),
+                    stat("Working days (8 h)", format(round(s$days, 1), big.mark = ",", nsmall = 1)),
+                    stat("Unique POs", format(s$pos, big.mark = ",")),
+                    stat("Integrated line items", format(s$lines, big.mark = ","))),
+           tags$p(class = "text-xs mt-4 mb-0", style = "color:#64748b;",
+                  paste0(scope, ". Per unique PO (plant + customer PO no.): ", PUNCH_FIRST_LINE_MIN,
+                         " min for the first line item + ", PUNCH_EXTRA_LINE_MIN,
+                         " min for each extra line item, as shared by the CS team.",
+                         if (s$no_po_lines > 0) paste0(" ", format(s$no_po_lines, big.mark = ","),
+                                                       " integrated line items have no PO number and are not counted.") else "")))
+}
+
 write_mom_company_workbook <- function(tbl, file) {
   wb <- createWorkbook()
   addWorksheet(wb, "MoM by Company", gridLines = FALSE)
@@ -2345,6 +2417,47 @@ server <- function(input, output, session) {
     output$dl_po_detail     <- dl(function() paste0("po_detail_", Sys.Date(), ".csv"),
                                   function(f) write.csv(consider_df() %>% filter(`PID-CID` != "9802"), f, row.names = FALSE))
 
+    # ── Time saved by integration ────────────────────────────────────────────
+    time_saved_po_df <- reactive({ req(consider_df()); consider_df() %>% filter(`PID-CID` != "9802") })
+
+    output$time_saved_dashboard <- renderUI({
+      req(consider_df())
+      time_saved_strip(po_time_saved_summary(consider_df()), "Valid line items, all companies")
+    })
+    output$time_saved_po <- renderUI({
+      time_saved_strip(po_time_saved_summary(time_saved_po_df()), "Valid line items, ABFRL excluded")
+    })
+    output$time_saved_analytics <- renderUI({
+      req(global_filters$data())
+      time_saved_strip(po_time_saved_summary(global_filters$data()), "Valid line items in the current analytics filters")
+    })
+
+    time_saved_dt <- function(tbl, bar_col) {
+      if (!nrow(tbl)) return(datatable(data.frame(Message = "No integrated POs in scope"), options = list(dom = "t")))
+      datatable(tbl, rownames = FALSE,
+                options = list(pageLength = 15, dom = "tp", scrollX = TRUE,
+                               columnDefs = list(list(targets = "_all", className = "dt-center")))) %>%
+        formatRound(c("Unique POs", "Integrated line items", "Minutes saved"), digits = 0, mark = ",") %>%
+        formatRound(c("Hours saved", "Working days (8 h)"), digits = 1, mark = ",") %>%
+        formatStyle(bar_col, background = styleColorBar(range(tbl[[bar_col]]), "#dcfce7"),
+                    backgroundSize = "100% 80%", backgroundRepeat = "no-repeat", backgroundPosition = "center") %>%
+        formatStyle(columns = colnames(tbl), fontSize = "13px")
+    }
+    time_saved_company_tbl <- reactive(po_time_saved_by(time_saved_po_df(), `PID-CID`, `Client Name`))
+    time_saved_month_tbl   <- reactive(po_time_saved_by(time_saved_po_df(), Month) %>% arrange(Month))
+    output$time_saved_by_company <- renderDT(time_saved_dt(time_saved_company_tbl(), "Hours saved"))
+    output$time_saved_by_month   <- renderDT(time_saved_dt(time_saved_month_tbl(), "Hours saved"))
+    output$dl_time_saved_company <- dl(function() paste0("time_saved_by_company_", Sys.Date(), ".csv"),
+                                       function(f) write.csv(time_saved_company_tbl(), f, row.names = FALSE))
+    output$dl_time_saved_month   <- dl(function() paste0("time_saved_by_month_", Sys.Date(), ".csv"),
+                                       function(f) write.csv(time_saved_month_tbl(), f, row.names = FALSE))
+    output$dl_time_saved_pos     <- dl(function() paste0("time_saved_per_po_", Sys.Date(), ".csv"),
+                                       function(f) write.csv(po_time_saved_table(time_saved_po_df()) %>%
+                                                               rename(`Plant ID` = `buyer.id`, `Customer PO No` = PO,
+                                                                      `First month` = Month, `Integrated line items` = Lines,
+                                                                      `Minutes saved` = Minutes),
+                                                             f, row.names = FALSE))
+
     output$dl_license_request <- downloadHandler(
       filename = function() paste0("procuregraph_license_request_", format(Sys.Date(), "%Y%m%d"), ".json"),
       content = function(file) {
@@ -3068,6 +3181,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;b
                               kpi_card_inline("verified", "Valid line items",                          format(valid_n, big.mark = ","),                     "#f97316", "#ffedd5", valid_pct,         paste0(valid_pct, "% of total"),                                "anim-in-2"),
                               kpi_card_inline("business", "Line items of integrated customers",        format(integrated_customers_lines, big.mark = ","),   "#10b981", "#d1fae5", if(integrated_customers_lines>0) round(integrated_customers_lines/valid_n*100,1) else 0, paste0(if(valid_n>0) round(integrated_customers_lines/valid_n*100,1) else 0,"% of valid line items"), "anim-in-3"),
                               kpi_card_inline("sync_alt", "Integrated items of integrated customers",  format(integrated_items_live, big.mark = ","),         "#da191e", "#ffe0e0", live_customers_pct, paste0(live_customers_pct, "% of integrated lines"),          "anim-in-4")),
+                 uiOutput("time_saved_dashboard"),
                  tags$section(class = "grid grid-cols-2 gap-8 anim-in anim-in-4",
                               tags$div(class = paste(CARD, "p-6"), style = BORDER,
                                        tags$div(class = "flex items-center gap-2 mb-1",
@@ -3085,7 +3199,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;b
                           tags$div(class = "flex items-center gap-2 mb-4",
                                    tags$span(class = "material-symbols-outlined", style = "color:#006495;", "functions"),
                                    tags$h3(class = "text-sm font-extrabold uppercase tracking-widest", "Metric Formulas")),
-                          tags$div(class = "grid grid-cols-3 gap-4",
+                          tags$div(class = "grid grid-cols-4 gap-4",
                                    tags$div(class = "p-4 rounded-xl", style = "background:#f0f9ff;",
                                             tags$p(class = "text-[10px] font-bold uppercase tracking-widest mb-2", style = "color:#006495;", "Integration %"),
                                             tags$code(class = "text-xs font-bold", "SAP \u00f7 Grand Total \u00d7 100"),
@@ -3097,7 +3211,11 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;b
                                    tags$div(class = "p-4 rounded-xl", style = "background:#fff7ed;",
                                             tags$p(class = "text-[10px] font-bold uppercase tracking-widest mb-2", style = "color:#ea580c;", "Final Integration %"),
                                             tags$code(class = "text-xs font-bold", "(SAP+Manual) \u00f7 Grand Total \u00d7 100"),
-                                            tags$p(class = "text-[10px] mt-2", style = "color:#64748b;", "Overall integration effectiveness")))),
+                                            tags$p(class = "text-[10px] mt-2", style = "color:#64748b;", "Overall integration effectiveness")),
+                                   tags$div(class = "p-4 rounded-xl", style = "background:#f0fdf4;",
+                                            tags$p(class = "text-[10px] font-bold uppercase tracking-widest mb-2", style = "color:#15803d;", "Time saved"),
+                                            tags$code(class = "text-xs font-bold", "Σ per unique PO: 4.5 + (lines − 1) × 1 min"),
+                                            tags$p(class = "text-[10px] mt-2", style = "color:#64748b;", "SAP + Manual line items; unique PO = plant + customer PO no.")))),
                  tags$section(class = "space-y-4 anim-in anim-in-5",
                               tags$h2(class = "text-2xl font-extrabold", "Integration Pivot"),
                               tags$div(class = "grid grid-cols-2 gap-6",
@@ -3127,6 +3245,16 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;b
                  tags$section(class = "grid grid-cols-2 gap-6",
                               uiOutput("companies_by_status_card"),
                               uiOutput("integration_rate_card")),
+                 tags$section(class = "space-y-3",
+                              section_hdr("Time Saved by Integration", "PO punching time the integration removed: 4.5 min for a PO's first line item + 1 min per extra line item, per unique PO (plant + customer PO no.).", "dl_time_saved_pos", "#15803d", "Per-PO CSV"),
+                              uiOutput("time_saved_po"),
+                              tags$div(class = "grid grid-cols-2 gap-6",
+                                       tags$div(class = "space-y-3",
+                                                section_hdr("Time Saved by Company", "Highest first", "dl_time_saved_company", "#15803d"),
+                                                tags$div(class = paste(CARD, "overflow-x-auto"), style = BORDER, DTOutput("time_saved_by_company"))),
+                                       tags$div(class = "space-y-3",
+                                                section_hdr("Time Saved by Month", "A PO counts in the month of its first line item", "dl_time_saved_month", "#15803d"),
+                                                tags$div(class = paste(CARD, "overflow-x-auto"), style = BORDER, DTOutput("time_saved_by_month"))))),
                  tags$section(class = "space-y-3",
                               section_hdr("Line items by Company (Month-on-Month)", "Each month block shows SAP, Manual, EOC, Total, Integration %. Final columns are overall totals.", "dl_po_company", "#16a34a", "Excel"),
                               tags$div(class = paste(CARD, "overflow-x-auto"), style = BORDER, DTOutput("po_by_company"))),
@@ -3344,7 +3472,8 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;b
                                                 formula_row("R: RemoveHavellsCapex",           "Calculated", "PID-CID=1211: Ignore if SANumber starts 45"),
                                                 formula_row("S: RemoveSC",                     "Calculated", "PID-CID=8853+buyers: Ignore if SANumber starts 71"),
                                                 formula_row("T: Remove(Y/N)",                  "Calculated", "Remove if ANY of O,P,L,Q,R,S,U = Ignore"),
-                                                formula_row("U: GRN",                          "Excel Join", "GRN Status from 150 CID; NA \u2192 Ignore"))),
+                                                formula_row("U: GRN",                          "Excel Join", "GRN Status from 150 CID; NA \u2192 Ignore"),
+                                                formula_row("Time saved",                      "Calculated", "Per unique PO (buyer.id + C), SAP/Manual valid lines: 4.5 + (lines \u2212 1) \u00d7 1 min"))),
                               tags$div(class = "flex gap-4 mt-4 pt-4", style = "border-top:1px solid #f1f5f9;",
                                        lapply(list(
                                          list("MongoDB",    "#e0f0ff", "#006495", "Direct from MongoDB"),
@@ -3471,7 +3600,9 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;b
                  uiOutput("global_filter_panel"),
                  
                  uiOutput("analytics_data_health"),
-                 
+
+                 uiOutput("time_saved_analytics"),
+
                  uiOutput("analytics_benchmark_summary"),
                  
                  uiOutput("analytics_opportunity_radar"),
